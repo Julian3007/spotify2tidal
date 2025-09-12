@@ -1,0 +1,6 @@
+# Required packages for Spotify to TIDAL Transfer Tool
+spotipy==2.22.1
+tidalapi==0.7.6
+tqdm==4.66.1
+pandas==2.1.4
+python-dotenv==1.0.0
