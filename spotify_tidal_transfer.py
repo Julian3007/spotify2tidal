@@ -44,28 +44,122 @@ class SpotifyTidalTransfer:
             client_id = os.getenv("SPOTIFY_CLIENT_ID")
             client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
             redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI", "http://localhost:8888/callback")
+            # Small, safe debug output to help troubleshoot missing/incorrect env vars or redirect URI mismatches.
+            def _mask(val: Optional[str]) -> str:
+                if not val:
+                    return "(missing)"
+                v = str(val)
+                if len(v) <= 4:
+                    return "****"
+                return "*" * (len(v) - 4) + v[-4:]
+
             if not client_id or not client_secret:
                 print("❌ Spotify credentials not set. Please set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in your .env file.")
+                print(f"🔎 SPOTIFY_CLIENT_ID present: {bool(client_id)} (masked: {_mask(client_id)})")
+                print(f"🔎 SPOTIFY_REDIRECT_URI: {redirect_uri!r}")
                 return False
+            # Show which client_id (masked) and redirect uri are being used so user can confirm dashboard settings.
+            print(f"🔎 SPOTIFY_CLIENT_ID present: {bool(client_id)} (masked: {_mask(client_id)})")
+            print(f"🔎 SPOTIFY_REDIRECT_URI: {redirect_uri!r}")
             scope = "user-library-read playlist-read-private user-follow-read"
             auth_manager = SpotifyOAuth(client_id=client_id, client_secret=client_secret, redirect_uri=redirect_uri, scope=scope)
-            self.spotify = spotipy.Spotify(auth_manager=auth_manager)
-            user = self.spotify.current_user()
-            print(f"✅ Connected to Spotify as {user.get('display_name', user['id'])}")
+            # Try normal auth manager flow first
+            try:
+                self.spotify = spotipy.Spotify(auth_manager=auth_manager)
+                user = self.spotify.current_user()
+                print(f"✅ Connected to Spotify as {user.get('display_name', user['id'])}")
+                return True
+            except Exception:
+                # Fall back to manual auth flow when redirect handling (e.g. https localhost) fails
+                try:
+                    import webbrowser
+                    print("🔁 Falling back to manual OAuth flow. A browser window will open; after you authorize, paste the full redirect URL here.")
+                    auth_url = auth_manager.get_authorize_url()
+                    print(f"🔗 Authorization URL: {auth_url}")
+                    try:
+                        webbrowser.open(auth_url)
+                    except Exception:
+                        pass
+
+                    # Prompt the user and validate that they pasted the redirect URL containing the authorization code.
+                    code = None
+                    for attempt in range(3):
+                        redirect_response = input("Paste the full redirect URL after authorizing (the URL in your browser address bar): ").strip()
+                        # Try spotipy helper first
+                        try:
+                            code = auth_manager.parse_response_code(redirect_response)
+                        except Exception:
+                            code = None
+                        # Fallback: parse query string for ?code= if parse_response_code didn't work
+                        if not code:
+                            try:
+                                from urllib.parse import urlparse, parse_qs
+                                parsed = urlparse(redirect_response)
+                                qs = parse_qs(parsed.query)
+                                if 'code' in qs:
+                                    code = qs['code'][0]
+                            except Exception:
+                                code = None
+
+                        if not code:
+                            print("⚠️ It looks like the pasted URL does not contain an authorization code. Make sure you paste the final redirect URL (it should contain 'code=').")
+                            if attempt < 2:
+                                print("Please try again.")
+                                continue
+                            else:
+                                print("Aborting manual OAuth after 3 failed attempts.")
+                                raise Exception("No authorization code provided by user")
+
+                    token_info = auth_manager.get_access_token(code)
+                    # token_info may be a dict or an access token string depending on spotipy version
+                    access_token = token_info['access_token'] if isinstance(token_info, dict) and 'access_token' in token_info else token_info
+                    if not access_token:
+                        print("❌ Could not obtain access token from the provided response.")
+                        return False
+                    self.spotify = spotipy.Spotify(auth=access_token)
+                    user = self.spotify.current_user()
+                    print(f"✅ Connected to Spotify as {user.get('display_name', user['id'])}")
+                    return True
+                except Exception as exc:
+                    print(f"❌ Manual OAuth flow failed: {exc}")
+                    self.spotify = None
+                    return False
             return True
         except Exception as e:
-            print(f"❌ Failed to connect to Spotify: {e}")
+            # Provide extra hint for invalid_client errors without exposing secrets
+            msg = str(e)
+            print(f"❌ Failed to connect to Spotify: {msg}")
+            if 'invalid_client' in msg.lower() or 'invalid client' in msg.lower():
+                print("   ℹ️ Common causes: redirect URI mismatch in Spotify Dashboard, incorrect client id/secret, or using the wrong app.")
             self.spotify = None
             return False
 
     def connect_tidal(self):
         """Connect to TIDAL and set self.tidal. Returns True if successful."""
         try:
-            session = tidalapi.Session()
-            print("🔑 Please log in to TIDAL in your browser window...")
-            session.login_oauth_simple()
+            import tidalapi as _tidal
+            version = getattr(_tidal, '__version__', 'unknown')
+            print(f"� tidalapi version: {version}")
+            session = _tidal.Session()
+            print("🔑 Initiating TIDAL login (device OAuth)...")
+            try:
+                session.login_oauth_simple()
+            except Exception as inner_e:
+                msg = str(inner_e)
+                if 'invalid_client' in msg.lower():
+                    print("❌ TIDAL authentication reported invalid_client.")
+                    print("   Possible causes:")
+                    print("   1. Outdated tidalapi library (try: pip install --upgrade tidalapi)")
+                    print("   2. TIDAL changed public client credentials used by tidalapi (update library)")
+                    print("   3. Regional restrictions or account type not supported")
+                    print("   4. Temporary TIDAL auth service issue")
+                    print("   Next steps:")
+                    print("     a) Upgrade: pip install --upgrade tidalapi")
+                    print("     b) If still failing, file an issue at https://github.com/tidalapi/tidalapi with the error.")
+                raise
             self.tidal = session
-            print(f"✅ Connected to TIDAL as {getattr(self.tidal.user, 'username', 'Unknown')}")
+            username = getattr(getattr(self.tidal, 'user', None), 'username', None)
+            print(f"✅ Connected to TIDAL as {username or 'Unknown'}")
             return True
         except Exception as e:
             print(f"❌ Failed to connect to TIDAL: {e}")
@@ -601,12 +695,167 @@ class SpotifyTidalTransfer:
             print("❌ No data found to export")
             return ""
     
+    def _normalize_search_text(self, text: str) -> str:
+        """Normalize text for better search matching."""
+        import re
+        if not text:
+            return ""
+        
+        # Remove content in parentheses/brackets (feat., live, remaster, etc.)
+        text = re.sub(r'\([^)]*\)', '', text)
+        text = re.sub(r'\[[^\]]*\]', '', text)
+        
+        # Remove common noise words
+        noise_words = ['feat.', 'ft.', 'featuring', 'with', 'vs.', 'vs', '&']
+        for word in noise_words:
+            text = re.sub(r'\b' + re.escape(word) + r'\b', '', text, flags=re.IGNORECASE)
+        
+        # Clean up whitespace
+        text = ' '.join(text.split())
+        return text.strip()
+    
+    def _extract_primary_artist(self, artist_str: str) -> str:
+        """Extract the primary (first) artist from a string that may contain multiple artists."""
+        if not artist_str:
+            return ""
+        
+        # Split on common separators
+        for sep in [',', ';', '&', ' and ', ' x ', ' X ']:
+            if sep in artist_str:
+                return artist_str.split(sep)[0].strip()
+        
+        return artist_str.strip()
+    
+    def _calculate_artist_similarity(self, artist1: str, artist2: str) -> float:
+        """Calculate simple similarity score between two artist names (0.0 to 1.0)."""
+        if not artist1 or not artist2:
+            return 0.0
+        
+        a1 = artist1.lower().strip()
+        a2 = artist2.lower().strip()
+        
+        # Exact match
+        if a1 == a2:
+            return 1.0
+        
+        # One contains the other
+        if a1 in a2 or a2 in a1:
+            return 0.9
+        
+        # Check if primary artist matches (useful for "Artist feat. Other")
+        primary1 = self._extract_primary_artist(a1)
+        primary2 = self._extract_primary_artist(a2)
+        if primary1 == primary2:
+            return 0.85
+        
+        # Simple word overlap
+        words1 = set(a1.split())
+        words2 = set(a2.split())
+        if words1 and words2:
+            overlap = len(words1 & words2) / max(len(words1), len(words2))
+            return overlap * 0.7
+        
+        return 0.0
+    
+    def search_tidal_track(self, track_name: str, artist_name: str, album_name: str = None, duration_ms: int = None) -> Optional[Dict]:
+        """
+        Search for a track on TIDAL using progressive fallback queries and smart result filtering.
+        Returns the best match as a dict with 'track', 'confidence', and 'query_used' keys, or None if not found.
+        """
+        import time
+        
+        # Normalize inputs
+        track_clean = self._normalize_search_text(track_name)
+        artist_clean = self._normalize_search_text(artist_name)
+        primary_artist = self._extract_primary_artist(artist_clean)
+        
+        if not track_clean:
+            return None
+        
+        # Progressive fallback queries (from most specific to least specific)
+        queries = [
+            f'"{track_clean}" "{primary_artist}"' if primary_artist else None,
+            f'{track_clean} {primary_artist}' if primary_artist else None,
+            f'{track_clean} {artist_clean}' if artist_clean and artist_clean != primary_artist else None,
+            track_clean
+        ]
+        queries = [q for q in queries if q]  # Remove None entries
+        
+        best_match = None
+        best_score = 0.0
+        query_used = None
+        
+        for query in queries:
+            try:
+                search_result = self.tidal.search(query, limit=10)
+                tracks = search_result.get('tracks', [])
+                
+                if not tracks:
+                    continue
+                
+                # Score each result
+                for track in tracks:
+                    score = 0.0
+                    
+                    # Artist similarity (most important)
+                    track_artist = track.artist.name if hasattr(track, 'artist') and track.artist else ""
+                    artist_sim = self._calculate_artist_similarity(artist_name, track_artist)
+                    score += artist_sim * 0.6
+                    
+                    # Album match (if available)
+                    if album_name and hasattr(track, 'album') and track.album:
+                        album_sim = self._calculate_artist_similarity(album_name, track.album.name)
+                        score += album_sim * 0.2
+                    
+                    # Duration match (if available)
+                    if duration_ms and hasattr(track, 'duration') and track.duration:
+                        duration_diff = abs(duration_ms - track.duration * 1000)
+                        if duration_diff < 5000:  # Within 5 seconds
+                            score += 0.2
+                        elif duration_diff < 15000:  # Within 15 seconds
+                            score += 0.1
+                    else:
+                        score += 0.1  # Small bonus if no duration to compare
+                    
+                    # Track name similarity (basic check)
+                    track_name_clean = self._normalize_search_text(track.name if hasattr(track, 'name') else "")
+                    if track_clean.lower() in track_name_clean.lower() or track_name_clean.lower() in track_clean.lower():
+                        score += 0.1
+                    
+                    # Update best match
+                    if score > best_score:
+                        best_score = score
+                        best_match = track
+                        query_used = query
+                
+                # If we found a high-confidence match, stop searching
+                if best_score >= 0.8:
+                    break
+                
+                # Small delay to avoid rate limiting
+                time.sleep(0.1)
+                
+            except Exception as e:
+                print(f"    ⚠️ Search error for query '{query}': {e}")
+                continue
+        
+        # Only return matches with reasonable confidence
+        if best_match and best_score >= 0.5:
+            return {
+                'track': best_match,
+                'confidence': best_score,
+                'query_used': query_used
+            }
+        
+        return None
+
     def import_to_tidal(self, tracks_csv: str = None, artists_csv: str = None, albums_csv: str = None, mode: str = "all"):
         """Import tracks, followed artists, and albums to TIDAL from CSV files. Handles single-type files gracefully."""
         import pandas as pd
         import time
         imported = 0
         failed = 0
+        failed_tracks = []  # Track failed imports for later review
         # Import tracks and playlists
         if tracks_csv:
             try:
@@ -633,17 +882,26 @@ class SpotifyTidalTransfer:
                         for idx, row in group.iterrows():
                             processed_idx.add(idx)
                             try:
-                                query = f"{row['name']} {row['artist']}"
-                                search_result = self.tidal.search(query)
-                                tracks = search_result['tracks'] if 'tracks' in search_result else []
-                                if tracks:
-                                    tidal_track = tracks[0]
+                                # Use enhanced search with validation
+                                match_result = self.search_tidal_track(
+                                    track_name=row['name'],
+                                    artist_name=row['artist'],
+                                    album_name=row.get('album'),
+                                    duration_ms=row.get('duration_ms')
+                                )
+                                
+                                if match_result:
+                                    tidal_track = match_result['track']
+                                    confidence = match_result['confidence']
                                     batch_ids.append(tidal_track.id)
                                     imported += 1
-                                    print(f"    ✅ Queued: {row['name']} - {row['artist']}")
+                                    confidence_emoji = "✅" if confidence >= 0.8 else "⚠️"
+                                    print(f"    {confidence_emoji} Queued: {row['name']} - {row['artist']} (confidence: {confidence:.0%})")
                                 else:
                                     print(f"    ❌ Not found on TIDAL: {row['name']} - {row['artist']}")
                                     failed += 1
+                                    failed_tracks.append({'track': row['name'], 'artist': row['artist'], 'playlist': playlist_name})
+                                
                                 if len(batch_ids) == 50:
                                     tidal_playlist.add(batch_ids)
                                     print(f"    ➡️ Added batch of 50 tracks to playlist '{playlist_name}'")
@@ -651,6 +909,7 @@ class SpotifyTidalTransfer:
                             except Exception as e:
                                 print(f"    ❌ Error importing {row['name']} - {row['artist']}: {e}")
                                 failed += 1
+                                failed_tracks.append({'track': row['name'], 'artist': row['artist'], 'playlist': playlist_name})
                         if batch_ids:
                             tidal_playlist.add(batch_ids)
                             print(f"    ➡️ Added final batch of {len(batch_ids)} tracks to playlist '{playlist_name}'")
@@ -660,20 +919,29 @@ class SpotifyTidalTransfer:
                     if playlist_col and idx in processed_idx:
                         continue
                     try:
-                        query = f"{row['name']} {row['artist']}"
-                        search_result = self.tidal.search(query)
-                        tracks = search_result['tracks'] if 'tracks' in search_result else []
-                        if tracks:
-                            tidal_track = tracks[0]
+                        # Use enhanced search with validation
+                        match_result = self.search_tidal_track(
+                            track_name=row['name'],
+                            artist_name=row['artist'],
+                            album_name=row.get('album'),
+                            duration_ms=row.get('duration_ms')
+                        )
+                        
+                        if match_result:
+                            tidal_track = match_result['track']
+                            confidence = match_result['confidence']
                             self.tidal.user.favorites.add_track(tidal_track.id)
                             imported += 1
-                            print(f"✅ Imported as favorite: {row['name']} - {row['artist']}")
+                            confidence_emoji = "✅" if confidence >= 0.8 else "⚠️"
+                            print(f"{confidence_emoji} Imported as favorite: {row['name']} - {row['artist']} (confidence: {confidence:.0%})")
                         else:
                             print(f"❌ Not found on TIDAL: {row['name']} - {row['artist']}")
                             failed += 1
+                            failed_tracks.append({'track': row['name'], 'artist': row['artist'], 'playlist': 'Favorites'})
                     except Exception as e:
                         print(f"❌ Error importing {row['name']} - {row['artist']}: {e}")
                         failed += 1
+                        failed_tracks.append({'track': row['name'], 'artist': row['artist'], 'playlist': 'Favorites'})
             except Exception as e:
                 print(f"❌ Error importing tracks/playlists: {e}")
         # Import favorite artists
@@ -712,7 +980,25 @@ class SpotifyTidalTransfer:
                         print(f"❌ Album not found on TIDAL: {row['album_name']} - {row['artist_name']}")
             except Exception as e:
                 print(f"❌ Error importing albums: {e}")
-        print(f"\nImport complete. Success: {imported}, Failed: {failed}")
+        
+        # Summary and failed tracks report
+        print(f"\n{'='*50}")
+        print(f"📊 Import Summary")
+        print(f"{'='*50}")
+        print(f"✅ Successfully imported: {imported}")
+        print(f"❌ Failed: {failed}")
+        if imported + failed > 0:
+            success_rate = (imported / (imported + failed)) * 100
+            print(f"📈 Success rate: {success_rate:.1f}%")
+        
+        # Save failed tracks to CSV for manual review
+        if failed_tracks:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            failed_filename = self.output_dir / f"tidal_import_failed_{timestamp}.csv"
+            df_failed = pd.DataFrame(failed_tracks)
+            df_failed.to_csv(failed_filename, index=False, encoding='utf-8')
+            print(f"\n💾 Failed tracks saved to: {failed_filename}")
+            print(f"   You can review and manually search for these tracks on TIDAL.")
     
     def list_csv_files(self) -> List[str]:
         """List available CSV files for import (only from exports directory)"""
