@@ -21,7 +21,7 @@ Spotify2Tidal is a tool designed to help users seamlessly transfer their music d
      pip install -r requirements.txt
      ```
 3. **Set up your credentials**
-   - You will need your Spotify Client ID, Client Secret, and Redirect URI. Get these from the [Spotify Developer Dashboard](https://developer.spotify.com/).
+   - You will need your Spotify Client ID, Client Secret, and Redirect URI. Today (16.10.25) ```http://127.0.0.1:8080``` works. Get these from the [Spotify Developer Dashboard](https://developer.spotify.com/).
    - The batch script (`run_transfer.bat`) can help you set up your `.env` file interactively.
 
 
@@ -71,3 +71,4 @@ This project is provided as-is for personal use.
 
 ## Disclaimer
 This tool is not affiliated with Spotify or TIDAL. Use at your own risk. Always comply with the terms of service of both platforms.
+
